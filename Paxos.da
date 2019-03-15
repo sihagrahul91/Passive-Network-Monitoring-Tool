@@ -1,0 +1,1116 @@
+#Importing Modules required
+import os
+import sys
+import time
+import logging
+from threading import Timer
+import coloredlogs
+import numpy
+from random import randint
+from random import uniform
+import matplotlib.pyplot as plt
+import heapq
+
+coloredlogs.install()
+config(clock='Lamport', channel='fifo')
+
+# Procedure used to compute the loss and delay of the message send
+# Returns False if the message is to be dropped, True otherwise
+def lossCompute(rate):
+    if rate == 0.0:                                                             # if loss rate is 0, message must be sent
+        return True
+    else:
+        i = uniform(0, 1)                                                       # else generate a random number between 0 and 1
+        if i <= rate:                                                           # if the number is less than the rate, the message should be dropped
+            return False
+        else:                                                                   # else the message should be sent
+            return True
+
+class Message:
+    def _repr_(self): pass
+
+
+# Figure 3: Message Types Starts
+
+class Client_Update(Message):                                                   # A1. - contains the following fields:
+    def __init__(self, client_id, server_id, timestamp, update):
+        self.client_id = client_id                                              # A2. - unique identifier of the sending client
+        self.server_id = server_id                                              # A3. - unique identifier of this client’s server
+        self.timestamp = timestamp                                              # A4. - client sequence number for this update
+        self.update = update                                                    # A5. - the update being initiated by the client
+
+    def _print(self):
+        print(self.client_id, self.server_id, self.timestamp, self.update)
+
+class View_Change(Message):                                                     # B1. - contains the following fields:
+    def __init__(self, server_id, attempted):
+        self.server_id = server_id                                              # B2. - unique identifier of the sending server
+        self.attempted = attempted                                              # B3. - view number this server is trying to install
+
+    def _print(self):
+        print(self.server_id, self.attempted)
+
+class VC_Proof(Message):                                                        # C1. - contains the following fields:
+    def __init__(self, server_id, installed):
+        self.server_id = server_id                                              # C2. - unique identifier of the sending server
+        self.installed = installed                                              # C3. - last view number this server installed
+
+class Prepare(Message):                                                         # D1. - contains the following fields:
+    def __init__(self, server_id, view, local_aru):
+        self.server_id = server_id                                              # D2. - unique identifier of the sending server
+        self.view = view                                                        # D3. - the view number being prepared
+        self.local_aru = local_aru                                              # D4. - the local aru value of the leader
+
+class Prepare_OK(Message):                                                      # E1. - contains the following fields:
+    def __init__(self, server_id, view, data_list):
+        self.server_id = server_id                                              # E2. - unique identifier of the sending server
+        self.view = view                                                        # E3. - the view number for which this message applies
+        self.data_list = data_list                                              # E4. - list of Proposals and Globally_Ordered_Updates
+
+class Proposal(Message):                                                        # F1. - contains the following fields:
+    def __init__(self, server_id, view, seq, update):
+        self.server_id = server_id                                              # F2. - unique identifier of the sending server
+        self.view = view                                                        # F3. - the view in which this Proposal is being made
+        self.seq = seq                                                          # F4. - the sequence number of this Proposal
+        self.update = update                                                    # F5. - the client update being bound to seq in this Proposal
+
+class Accept(Message):                                                          # G1. - contains the following fields:
+    def __init__(self, server_id, view, seq):
+        self.server_id = server_id                                              # G2. - unique identifier of the sending server
+        self.view = view                                                        # G3. - the view for which this message applies
+        self.seq = seq                                                          # G4. - the sequence number of the associated Proposal
+
+    def _print(self):
+        print(self.server_id, self.view, self.seq)
+
+class Globally_Ordered_Update(Message):                                         # H1. - contains the following fields:
+    def __init__(self, server_id, seq, update):
+        self.server_id = server_id                                              # H2. - unique identifier of the sending server
+        self.seq = seq                                                          # H3. - the sequence number of the update that was ordered
+        self.update = update                                                    # H4. - the client update bound to seq and globally ordered
+
+# Figure 3: Ends
+
+
+# Figure 2: Data Structures Starts
+
+# Server State variables
+class State:                                                                    # A2. - one of {LEADER_ELECTION, REG_LEADER, REG_NONLEADER}
+    LEADER_ELECTION = 0
+    REG_LEADER = 1
+    REG_NONLEADER = 2
+
+# Global Ordering variables
+class Global_History:                                                           # D3. - array of global_slots, indexed by sequence number, each containing:
+    def __init__(self, proposal, accepts, globally_ordered_update):
+        self.proposal = proposal                                                # D4. - latest Proposal accepted for this sequence number, if any
+        self.accepts = accepts                                                  # D5. - array of corresponding Accept messages, indexed by server id
+        self.globally_ordered_update = globally_ordered_update                  # D6. - ordered update for this sequence number, if any
+
+    def quorum_accepts(self):                                                   # Procedure to decide whether majority accepts has been received or not
+        if (len(self.accepts) - self.accepts.count(None)) >= int(len(self.accepts)/2):
+            return True
+        else:
+            return False
+
+    def clear_accepts(self):                                                    # Procedure to clear the accepts value
+        self.accepts = [None] * len(self.accepts)                               # [None for _ in self.accepts]
+
+    def _print(self):
+        print(self.proposal, str(self.accepts), self.globally_ordered_update)
+
+
+# Server Class
+class Server(process):
+
+    # setup the server process
+    def setup(servers, server_id, clients, monitor, lossrate, delay, inDefaultTimer, inUpdateTimer):
+
+    # Figure 2: Data Structures Starts
+        # Server State variables
+        self.My_server_id = server_id                                           # A1. int My_server_id - a unique identifier for this server
+        self.state = State.LEADER_ELECTION                                      # A2. State - one of {LEADER ELECTION, REG LEADER, REG NONLEADER}
+
+        # View State variables
+        self.Last_Attempted = 0                                                 # B1. int Last Attempted - the last view this server attempted to install
+        self.Last_Installed = 0 #None                                           # B2. int Last Installed - the last view this server installed
+        self.VC = None                                                          # B3. VC[] - array of View Change messages, indexed by server id
+
+        # Prepare Phase variables
+        self.prepare = None                                                     # C1. Prepare - the Prepare message from last preinstalled view, if received
+        self.Prepare_oks = list()                                               # C2. Prepare oks[] - array of Prepare OK messages received, indexed by server id
+
+        # Global Ordering variables
+        self.Local_Aru = 0 #None                                                # D1. int Local Aru - the local aru value of this server
+        self.Last_Proposed = None                                               # D2. int Last Proposed - last sequence number proposed by the leader
+        self.global_history = dict()                                            # D3. Global History[] - array of global slots, indexed by sequence number, each containing:
+
+        # Timers variables
+        self.Progress_Timer = inDefaultTimer                                    # E1. Progress Timer - timeout on making global progress
+        self.Update_Timer = inUpdateTimer                                       # E2. Update Timer - timeout on globally ordering a specific update
+
+        # Client Handling variables
+        self.Update_Queue = list()                                              # F1. Update Queue - queue of Client Update messages
+        self.Last_Executed = dict()                                             # F2. Last Executed[] - array of timestamps, indexed by client id
+        self.Last_Enqueued = dict()                                             # F3. Last Enqueued[] - array of timestamps, indexed by client id
+        self.Pending_Updates = dict()                                           # F4. Pending Updates[] - array of Client Update messages, indexed by client id
+
+
+        # Other variables (Not Mentioned in Paper)
+
+        self.DEFAULT_TIMER = inDefaultTimer                                     # Default timer value which will be used to initialize Progress Timer
+        self.servers = list(servers)                                            # List of Servers
+        self.clients = list(clients)                                            # List of Clients
+        self.replica_count = None
+        self.quorum_count = None
+        self.bounded_updates = set()                                            # set to keep track of updates (bounded/unbounded)
+        self.requests_dict = dict()                                             # for throughput calculation
+
+        self.Progress_Timer_ = None                                             # Progress Timer (an object of Timer class)
+        self.Update_Timer_ = list(clients)                                      # Update Timer: a list of Timer class objects. Number of objects are based on number of clients
+        self.isZombie = False                                                   # variable to replicate the behaviour whether a server is up or down
+
+    def run():                                                                  # Run procedure for the server
+        #logging.info(str(self) + " Server : " + str(server_id) + " setup completed!" + str(servers))
+        #output("Setup Completed for server id: ", server_id)
+        replica_count = len(servers)                                            # Initializing replica_count with length of servers
+        quorum_count = int(replica_count/2) + 1                                 # Initializing quorum count with majority value
+        VC =  [None] * replica_count                                            # Array of View Change messages, indexed by server id
+        Prepare_oks = [None] * replica_count                                    # Array of Prepare OK messages received, indexed by server id
+        Expiration_Progress_Timer()                                             # Invoking expire progress timer API to start the leader election
+        await(received('finish'))                                               # Waiting for the done message to be received from Monitor once the run is complete
+        #output('Server Exiting')
+        exit(0)
+
+    # Override the normal send API depending on the lossrate and delay
+    def sendMessage(message, to):
+        if lossCompute(lossrate):                                               #checks if the message should be sent depending on the lossrate
+            if delay != 0.0:                                                    #if delay is not 0
+                time.sleep(delay)                                               # wait for delay amount
+            send(message, to=to)                                                #send the message instantly
+
+    # Figure 4 Starts: Conflict checks to run on incoming messages. Messages for which a Conflict exists are discarded.
+
+    def Conflict(message):
+        if isZombie:
+            return True                                                         # To replicate the behaviour that server is dead
+        if isinstance(message, View_Change):                                    # A1. View Change VC(server id, attempted):
+            if message.server_id == My_server_id:                               # A2. if server id = My server id
+                return True                                                     # A3. return TRUE
+            if state != State.LEADER_ELECTION:                                  # A4. if State != leader election
+                return True                                                     # A5. return TRUE
+            if Progress_Timer != None:                                          # A6. if Progress Timer is set
+                return True                                                     # A7. return TRUE
+            if message.attempted <= Last_Installed:                             # A8. if attempted ≤ Last Installed
+                return True                                                     # A9. return TRUE
+            return False                                                        # A10. return FALSE
+
+        if isinstance(message, VC_Proof):                                       # B1. VC Proof V(server id, installed):
+            if message.server_id == My_server_id:                               # B2. if server id = My server id
+                return True                                                     # B3. return TRUE
+            if state != State.LEADER_ELECTION:                                  # B4. if State != leader election
+                return True                                                     # B5. return TRUE
+            return False                                                        # B6. return FALSE
+
+        if isinstance(message, Prepare):                                        # C1. Prepare(server id, view, leader aru):
+            if message.server_id == My_server_id:                               # C2. if server id = My server id
+                return True                                                     # C3. return TRUE
+            if message.view != Last_Attempted:                                  # C4. if view != Last Attempted
+                return True                                                     # C5. return TRUE
+            return False                                                        # C6. return FALSE
+
+        if isinstance(message, Prepare_OK):                                     # D1. Prepare OK(server id, view, data list):
+            if state != State.LEADER_ELECTION:                                  # D2. if State != leader election
+                return True                                                     # D3. return TRUE
+            if message.view != Last_Attempted:                                  # D4. if view != Last Attempted
+                return True                                                     # D5. return TRUE
+            return False                                                        # D6. return FALSE
+
+        if isinstance(message, Proposal):                                       # E1. Proposal(server id, view, seq, update):
+            if message.server_id == My_server_id:                               # E2. if server id = My server id
+                return True                                                     # E3. return TRUE
+            if state != State.REG_NONLEADER:                                    # E4. if State != reg nonleader
+                return True                                                     # E5. return TRUE
+            if message.view != Last_Installed:                                  # E6. if view != Last Installed
+                return True                                                     # E7. return TRUE
+            return False                                                        # E8. return FALSE
+
+        if isinstance(message, Accept):                                         # F1. Accept(server id, view, seq):
+            if message.server_id == My_server_id:                               # F2. if server id = My server id
+                return True                                                     # F3. return TRUE
+            if message.view != Last_Installed:                                  # F4. if view 6= Last Installed
+                return True                                                     # F5. return TRUE
+            if not message.seq in global_history or global_history[message.seq].proposal == None:       # F6. if Global History[seq] does not contain a Proposal from view #TODO
+                return True                                                     # F7. return TRUE
+            return False                                                        # F8. return FALSE
+
+    # Figure 4 Ends
+
+    # Figure 5 Starts: Rules for updating the Global History
+    def Update_Data_Structures(message):
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        if isinstance(message, View_Change):                                    # A1. View Change V(server id, view):
+            if VC[message.server_id] != None:                                   # A2. if VC[server id] is not empty
+                return                                                          # A3. ignore V
+            VC[message.server_id] = message                                     # A4. VC[server id] ← V
+
+        if isinstance(message, Prepare):                                        # B1. Prepare P(server id, view, leader aru):
+            prepare = message                                                   # B2. Prepare ← P
+
+        if isinstance(message, Prepare_OK):                                     # C1. Prepare OK P(server id, view, data list):
+            if Prepare_oks[message.server_id] != None:                          # C2. if Prepare oks[server id] is not empty    #TODO CORRECTION IN PAPER
+                return                                                          # C3. ignore P
+            Prepare_oks[message.server_id] = message                            # C4. Prepare OK[server id] ← P
+            for e in message.data_list:                                         # C5. for each entry e in data list
+                Update_Data_Structures(e)                                       # C6. Apply e to data structures
+
+        if isinstance(message, Proposal):                                       # D1. Proposal P(server id, view, seq, update):
+            if message.seq in global_history and global_history[message.seq].globally_ordered_update != None:   # D2. if Global History[seq].Globally Ordered Update is not empty
+                return                                                          # D3. ignore Proposal
+            if message.seq in global_history and global_history[message.seq].proposal != None:          # D4. if Global History[seq].Proposal contains a Proposal P’
+                if message.view > global_history[message.seq].proposal.view:    # D5. if P.view > P’.view
+                    global_history[message.seq].proposal = message              # D6. Global History[seq].Proposal ← P
+
+                    bounded_updates.add(message.update)
+                    global_history[message.seq].clear_accepts()                 # D7. Clear out Global History[seq].Accepts[]
+            else:                                                               # D8. else
+                    global_history[message.seq] = Global_History(message, [None] * replica_count, None)     # D9. Global History[seq].Proposal ← P
+
+        if isinstance(message, Accept):                                         # E1. Accept A(server id, view, seq):
+            # output(message.server_id, message.view, message.seq)                      #
+            if message.seq in global_history and global_history[message.seq].globally_ordered_update != None:   # E2. if Global History[seq].Globally Ordered Update is not empty
+                return                                                          # E3. ignore A
+            if message.seq in global_history and global_history[message.seq].quorum_accepts() == True:      # E4. if Global History[seq].Accepts already contains ⌊N/2⌋ Accept messages
+            # or lenof(x, x in global_history[message.seq].accepts, x!=None) >= len(global_history[message.seq].accepts)/2
+                return                                                          # E5. ignore A
+            if message.seq in global_history and global_history[message.seq].accepts[message.server_id] != None:    # E6. if Global History[seq].Accepts[server id] is not empty
+                return                                                          # E7. ignore A
+            global_history[message.seq].accepts[message.server_id] = message    # E8. Global History[seq].Accepts[server id] ← A
+
+        if isinstance(message, Globally_Ordered_Update):                        # F1. Globally Ordered Update G(server id, seq, update):
+            if message.seq in global_history and global_history[message.seq].globally_ordered_update == None:   # F2. if Global History[seq] does not contain a Globally Ordered Update
+               #logging.error("originally Executed the update in my state " + str(message.seq))
+               # output("Executed the update for message sequence: ", message.seq, " for server id: ", self.My_server_id)
+               global_history[message.seq].globally_ordered_update = message    # F3. Global History[seq] ← G
+
+    # Figure 5 Ends
+
+    # Figure 6 Starts: Leader Election
+
+    # Procedure invoked when progress timer expires for a server
+    def Expiration_Progress_Timer():                                            # A1. Upon expiration of Progress Timer:
+        if isZombie:                                                            # To replicate the behaviour that server is dead
+            return
+        #output("Progress timer expired: ", Progress_Timer," Shifting to Leader Election for server_id: ", self.My_server_id, " Last Attempted was: ", Last_Attempted)
+        #send(('Expire_Progress_Timer', My_server_id, Last_Attempted, Progress_Timer, time.time()), to=monitor)     # Used for logging Leader Election in Monitor Class
+        Progress_Timer = None                                                   # Default value initialization of Progress_Timer
+        Shift_to_Leader_Election(Last_Attempted+1)                              # A2. Shift to Leader Election(Last Attempted+1)
+
+    # Procedure invoked when a view changes message is received by a server
+    def Receive_View_Change(message):                                           # B1. Upon receiving View Change(server id, attempted) message, V:
+        if isZombie:
+            return
+        #output("Process view Change for server id: ", self.My_server_id, " Message Server id: ", message.server_id, " Message Attempted: ", message.attempted)
+        if message.attempted > Last_Attempted and Progress_Timer == None:       # B2. if attempted > Last Attempted and Progress Timer not set
+            Shift_to_Leader_Election(message.attempted)                         # B3. Shift to Leader Election(attempted)
+            Update_Data_Structures(message)                                     # B4. Apply V to data structures
+        elif message.attempted == Last_Attempted:                               # B5. if attempted = Last Attempted
+            Update_Data_Structures(message)                                     # B6. Apply V to data structures
+            if Preinstall_Ready(message.attempted):                             # B7. if Preinstall Ready(attempted)
+                Progress_Timer = DEFAULT_TIMER * 2                              # B8. Progress Timer ← Progress Timer∗2
+                DEFAULT_TIMER = Progress_Timer
+                #logging.critical("I am server" + str(self.My_server_id) + " setting my progress timer")
+                Progress_Timer_ = Timer(self.Progress_Timer, Expiration_Progress_Timer)     # B9. Set Progress Timer
+                Progress_Timer_.start()                                         # Start progress timer
+                #logging.warning("Here I am server" + str(self.My_server_id) + " setting my progress timer")
+                #output("Server with server id: ", self.My_server_id, " is restarting the Progress Timer")
+
+                if Leader_of_Last_Attempted(Last_Attempted):                            # B10. if leader of Last Attempted
+                    #output("I AM THE LEADER in preinstall phase: ",self.My_server_id)
+                    Shift_To_Prepare_Phase()                                    # B11. Shift to Prepare Phase()
+
+    # Procedure invoked when VC_Proof message is received by server
+    def Receive_VC_Proof(message):                                              # C1. Upon receiving VC Proof(server id, installed) message, V:
+        if isZombie:                                                            # To replicate the behaviour that server is dead
+            return
+        if message.installed > Last_Installed:                                  # C2. if installed > Last Installed
+            Last_Attempted = message.installed                                  # C3. Last Attempted ← installed
+            if Leader_of_Last_Attempted(Last_Attempted):                        # C4. if leader of Last Attempted
+                Shift_To_Prepare_Phase()                                        # C5. Shift to Prepare Phase()
+            else:                                                               # C6. else
+                Shift_to_Reg_Non_Leader()                                       # C7. Shift to Reg Non Leader()
+
+
+    # Figure 6: Procedure invoked when new leader election starts
+    def Shift_to_Leader_Election(view):                                         # E1. Shift to Leader Election(int view):
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        state = State.LEADER_ELECTION                                           # Initializing state value of ther server to Leader Election
+        VC = [None] * replica_count                                             # E2. Clear data structures: VC[]
+        prepare = None                                                          # E2. Clear data structures: Prepare
+        Prepare_oks = [None] * len(Prepare_oks)                                 # E2. Clear data structures: Prepare oks
+        Last_Enqueued = dict()                                                  # E2. Clear data structures: Last Enqueued[]
+        Last_Attempted = view                                                   # E3. Last Attempted ← view
+        vc = View_Change(My_server_id, Last_Attempted)                          # E4. vc ← Construct VC(Last Attempted)
+        sendMessage(('View_Change',vc), to=servers)                             # E5. SEND to all servers: vc
+        Update_Data_Structures(vc)                                              # E6. Apply vc to data structures
+        #output("Completed : Shift_to_Leader_Election")
+
+    # Figure 6: Procedure invoked when view change message is received and a server is checking for majority of accept for the view change
+    def Preinstall_Ready(view):                                                 # D1. bool Preinstall Ready(int view):
+        if isZombie:
+            return False                                                        # To replicate the behaviour that server is dead
+        if len([i for i in VC if i != None and i.attempted==view]) >= quorum_count:     # D2. if VC[] contains ⌊N/2⌋ + 1 entries, v, with v.attempt = view
+            return True                                                         # D3. return TRUE
+        else:                                                                   # D4. else
+            return False                                                        # D5. return FALSE
+    #Figure 6: Ends
+
+    # Figure 7 Starts : Shifting to prepare phase when view change message got an accept from majority of servers
+    def Shift_To_Prepare_Phase():                                               # A1. Shift To Prepare Phase()
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        Last_Installed = Last_Attempted                                         # A2. Last Installed ← Last Attempted
+        prepare = Prepare(My_server_id, Last_Installed, Local_Aru)              # A3. prepare ← Construct Prepare(Last Installed, Local Aru)
+        Update_Data_Structures(prepare)                                         # A4. Apply prepare to data structures
+        data_list = Construct_DataList(Local_Aru)                               # A5. data list ← Construct DataList(Local Aru)
+        Prepare_ok = Prepare_OK(My_server_id, Last_Installed, data_list)        # A6. prepare ok ← Construct Prepare OK(Last Installed, data list)
+        Prepare_oks[My_server_id] = Prepare_ok                                  # A7. Prepare OK[My Server id] ← prepare ok
+        Last_Enqueued = dict()                                                  # A8. Clear Last Enqueued[]
+        #TODO sync to disk                                                      # A9. **Sync to disk
+        sendMessage(('Prepare',prepare), to=servers)                            # A10. SEND to all servers: prepare
+
+    # Figure 7: Receiving of prepare message from the preinstall leader server
+    def Receive_Prepare(message,p):                                             # B1. Upon receiving Prepare(server id, view, aru)
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        #output("Got Prepare Request From Server:",p,"Message: ",message.server_id, message.view, message.local_aru)
+        if state == State.LEADER_ELECTION:                                      # B2. if State = leader election /* Install the view */
+            Update_Data_Structures(message)                                     # B3. Apply Prepare to data structures
+            data_list = Construct_DataList(message.local_aru)                   # B4. data list ← Construct DataList(aru)
+            Prepare_ok = Prepare_OK(My_server_id, message.view, data_list)      # B5. prepare ok ← Construct Prepare OK(view, data list)
+            Prepare_oks[My_server_id] = Prepare_ok                              # B6. Prepare OK[My server id] ← prepare ok
+            Shift_to_Reg_Non_Leader()                                           # B7. Shift to Reg Non Leader()
+            #output("Sending Prepare OK from server: ",Prepare_ok.server_id, " with view: ", Prepare_ok.view, " and data_list: ", Prepare_ok.data_list)
+            sendMessage(('Prepare_ok',Prepare_ok), to=p)                        # B8. SEND to leader: prepare ok
+        else:                                                                   # B9. else /* Already installed the view */
+            sendMessage(('Prepare_ok',Prepare_oks[My_server_id]), to=p)         # B10. SEND to leader: Prepare OK[My server id]
+
+    # Figure 7: Receiving of Prepare_Ok message from different server for the preinstall view
+    def Receive_Prepare_OK(message):                                            # C1. Upon receiving Prepare OK(server id, view, data list)
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        #output("Got Prepare OK Message from server: ", message.server_id, " with view: ", message.view, " and datalist: ", message.data_list)
+        Update_Data_Structures(message)                                         # C2. Apply to data structures
+        if View_Prepared_Ready(message.view):                                   # C3. if View Prepared Ready(view)
+            #output("View Prepared Ready for server: ", My_server_id)
+            #output("Got Leader Installed for server: ", My_server_id)
+            Shift_to_Reg_Leader()                                               # C4. Shift to Reg Leader()
+
+
+    # Figure 8: Prepare Phase Utility Functions
+    def Construct_DataList(aru):        # A1. datalist t Construct DataList(int aru)
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        data_list = list()                                                      # A2. datalist ← ∅
+        for k in global_history:                                                # A3. for each sequence number i, i > aru, where Global History[i] is not empty
+            if k > aru:
+                if global_history[k].globally_ordered_update != None:           # A4. if Global History[i].Ordered contains a Globally Ordered Update, G
+                    data_list.append(global_history[k].globally_ordered_update) # A5. datalist ← datalist ∪ G
+                else:                                                           # A6. else
+                    data_list.append(global_history[k].proposal)                # A7. datalist ← datalist ∪ Global History[i].Proposal
+        return data_list                                                        # A8. return datalist
+
+    # Figure 8: Procedure invoked to see whether prepare ok message is received from majority of servers from the preinstall leader
+    def View_Prepared_Ready(view):                                              # B1. bool View Prepared Ready(int view)
+        if isZombie:
+            return False                                                        # To replicate the behaviour that server is dead
+        if len([i for i in Prepare_oks if i != None and i.view==view]) >= quorum_count:     # B2. if Prepare oks[] contains ⌊N/2⌋ + 1 entries, p, with p.view = view
+            return True                                                         # B3. return TRUE
+        else:                                                                   # B4. else
+            return False                                                        # B5. return FALSE
+
+    # Figure 9: Shift to Reg Leader. Leader state is assigned and proposal is send to all other servers
+    def Shift_to_Reg_Leader():                                                  # A1. Shift to Reg Leader()
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        state = State.REG_LEADER                                                # A2. State ← reg leader
+        #send(('Leader_Elected_Log', My_server_id, Last_Installed, time.time()), to=monitor)
+        sendMessage(('Leader_elected', My_server_id, Last_Installed), to=monitor)
+        Enqueue_Unbound_Pending_Updates()                                       # A3. Enqueue Unbound Pending Updates()
+        Remove_Bound_Updates_From_Queue()                                       # A4. Remove Bound Updates From Queue()
+        Last_Proposed = Local_Aru                                               # A5. Last Proposed ← Local Aru
+        Send_Proposal()                                                         # A6. Send Proposal()
+
+    # Figure 9: Shift to Non Leader. Non Leader state is assigned to the server and update queue is emptied
+    def Shift_to_Reg_Non_Leader():                                              # B1. Shift to Reg Non Leader()
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        state = State.REG_NONLEADER                                             # B2. State ← reg nonleader
+        Last_Installed = Last_Attempted                                         # B3. Last Installed ← Last Attempted
+        Update_Queue = list()                                                   # B4. Clear Update Queue
+        #TODO sync to disk                                                      # B5. **Sync to disk
+
+    # Figure 10: Procedure invoked when client update is received by Server with message tag = Client_Update
+    #def receive(msg=('Client_Update', U), from_=p):                             # A1. Upon receiving Client Update(client id, server id, timestamp, update), U:
+    #    if isZombie:
+    #        return                                                              # To replicate the behaviour that server is dead
+    #    if U.server_id != My_server_id and p in clients:                        # To handle error condition where client sends a message to a server id different from the server id containing in the message. Valid for Servers as Non-Leader can send the message to Leader.
+    #        logging.error("Invalid message from client to a wrong server as the message contains different server id")  # Logging the error
+    #        return                                                              # Not handling the error messages
+    #    if Conflict(U) == False:                                                # To check whether there is a conflict of message received or not
+    #        Client_Update_Handler(U)                                            # A2. Client Update Handler(U)
+
+    # Figure 10: Procedure invoked when proposal message is received from the leader
+    def Receive_Proposal(message):                                              # B1. Upon receiving Proposal(server id, view, seq, update):
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        #output("Received Proposal by server: ", self.My_server_id," with message server id: ", message.server_id, " message view: ", message.view, " message seq: ", message.seq, " message update: ",message.update)
+        Update_Data_Structures(message)                                         # B2. Apply Proposal to data structures
+        #output("Accepting update for message seq: ", message.seq)
+        accept = Accept(My_server_id, message.view, message.seq)                # B3. accept ← Construct Accept(My server id, view, seq)
+        #output("Sending Accept by server: ", My_server_id, " for message sequence: ", message.seq)                         #
+        #TODO sync to disk                                                      # B4. **Sync to disk
+        sendMessage(('Accept', accept), to=servers)                             # B5. SEND to all servers: accept
+
+    # Figure 10: Procedure invoked when accept message is received by the leader
+    def Receive_Accept(message):                                                # C1. Upon receiving Accept(server id, view, seq):
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        Update_Data_Structures(message)                                         # C2. Apply Accept to data structures
+        #output("Got the Accept message for message sequence: ", message.seq)
+        # Added condition global_history[message.seq].globally_ordered_update == None, to avoid multiple sending of reply to client due to Upon_Executing_Client_Update
+        if Globally_Ordered_Ready(message.seq) and global_history[message.seq].globally_ordered_update == None:   # C3. if Globally Ordered Ready(seq)
+            # output("2 Received Accept:",message.seq)
+            globally_ordered_update = global_history[message.seq].proposal      # C4. globally ordered update ← Construct Globally Ordered Update(seq)
+            globally_ordered_update = Globally_Ordered_Update(globally_ordered_update.server_id, globally_ordered_update.seq, globally_ordered_update.update)
+            Update_Data_Structures(globally_ordered_update)                     # C5. Apply globally ordered update to data structures
+            #logging.error("Executed the update in my state " + str(message.seq) + "   -----------  " + str(globally_ordered_update.update.client_id) + " " + str(globally_ordered_update.update.update))
+            #logging.warning(str(self) + " process accept " + str(Local_Aru))
+            #output("Got the accept message of Global Ordered by server: ", self.My_server_id)
+            #output("Received Accept for globally ordered update")
+            Upon_Executing_Client_Update(global_history[:q].globally_ordered_update.update)            # Not mentioned in paper. C has a different implementation where they are updating timestamps at which client request with a particular sequence number was done
+            Advance_Aru()                                                       # C6. Advance Aru()
+
+    # Figure 10: Procedure invoked when client request is executed. This procedure sends a reply to the client
+    def Upon_Executing_Client_Update(message):                                  # D1. Upon executing a Client Update(client id, server id, timestamp, update), U:
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        Advance_Aru()                                                           # D2. Advance Aru()
+        #output("Upon Executing Client Update. Length of global_history: ",len(global_history), " Length of Pending Updates", len(Pending_Updates))
+        if message.server_id == My_server_id:                                   # D3. if server id = My server id
+            #output("Sending a reply to client: ", message.client_id, " from server: ", My_server_id, " for updatenummber: ", message.timestamp)
+            Reply_to_client = "Executed Update " + str(message.timestamp)
+            send(('Reply', Reply_to_client, message.timestamp, My_server_id), to=clients[message.client_id])    # D4. Reply to client
+            #output("Sending reply back to the client: ", message.client_id, " from server: ", My_server_id)
+            if message.client_id in Pending_Updates:                            # D5. if U is in Pending Updates[client id]
+                #output("Cancelling Update Timer after executing client update for client: ", message.client_id, " for server: ", My_server_id)
+                Update_Timer_[message.client_id].cancel()                       # D6. Cancel Update Timer(client id)
+                Pending_Updates.pop(message.client_id)                          # D7. Remove U from Pending Updates[]
+        #output("Executing client update for client: ", message.client_id, " and update number: ", message.timestamp)
+        Last_Executed[message.client_id] = message.timestamp                    # D8. Last Executed[client id] ← timestamp
+        if state != State.LEADER_ELECTION:                                      # D9. if State != leader election
+            Progress_Timer_.cancel()                                            # D10: Restart Progress timer
+            Progress_Timer_ = Timer(self.Progress_Timer, Expiration_Progress_Timer)     # D10: Restart Progress timer
+            Progress_Timer_.start()                                             # D10. Restart Progress Timer
+        if state == State.REG_LEADER:                                           # D11. if State = reg leader
+            Send_Proposal()                                                     # D12. Send Proposal()
+
+    # Figure 11: Global Ordering Utility Procedures
+    def Send_Proposal():                                                        # A1. Send Proposal()
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        seq = Last_Proposed + 1                                                 # A2. seq ← Last Proposed + 1
+        while (seq in global_history and global_history[seq].globally_ordered_update != None):  # A3. if Global History[seq].Globally Ordered Update is not empty
+            Last_Proposed += 1                                                  # A4. Last Proposed++
+            seq = Last_Proposed + 1
+            #Send_Proposal()                                                        # A5. Send Proposal()
+        u = None                                                                # Corrected the case where u was not being initialized after coming out of recursion stack
+        if seq in global_history and global_history[seq].proposal:              # A6. if Global History[seq].Proposal contains a Proposal P
+            u = global_history[seq].proposal.update                             # A7. u ← P.update
+        elif Update_Queue == None or len(Update_Queue)==0:                      # A8. else if Update Queue is empty
+            #output("Nothing to Propose by Server: ", My_server_id)
+            return                                                              # A9. return
+        else:                                                                   # A10. else
+            u = Update_Queue.pop(0)                                             # A11. u ← Update Queue.pop()
+        #output("Leader: ", My_server_id, " is sending a proposal for client: ", u.client_id, " with update number: ", u.timestamp)
+        proposal = Proposal(My_server_id, Last_Installed, seq, u)               # A12. proposal ← Construct Proposal(My server id, view, seq, u)
+        Update_Data_Structures(proposal)                                        # A13. Apply proposal to data structures
+        #output("Sending Proposal to all Servers:",proposal.update)
+        Last_Proposed = seq                                                     # A14. Last Proposed ← seq
+        # sync to Disk                                                          # A15. **Sync to disk
+        sendMessage(('Proposal',proposal), to=servers)                          # A16. SEND to all servers: proposal
+
+    # Figure 11: Procedure used to checck whether the client update is ready for Global Ordering or not
+    def Globally_Ordered_Ready(seq):                                            # B1. bool Globally Ordered Ready(int seq)
+        if isZombie:
+            return False                                                        # To replicate the behaviour that server is dead
+        #output("Globally Ordered Ready for server: ", My_server_id, " with sequence number: ", seq)
+        #logging.error("Globally Ordered Ready  "+str(self)+ "  "+str(len([i for i in global_history[seq].accepts if i!=None and i.seq==seq])))
+
+        # B2. if Global History[seq] contains a Proposal and ⌊N/2⌋ Accepts from the same view
+        if seq in global_history and global_history[seq].proposal != None and len([i for i in global_history[seq].accepts if i!=None and i.seq==seq]) >= quorum_count-1:
+            return True                                                         # B3. return TRUE
+        else:                                                                   # B4. else
+            return False                                                        # B5. return FALSE
+
+    # Figure 11: Procedure used to advance local aru so that it can be upto date with global history
+    def Advance_Aru(): #Fig 11 C1-C8                                            # C1. Advance Aru()
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        i = Local_Aru+1                                                         # C2. i ← Local Aru +1
+        while True:                                                             # C3. while (1)
+            if i in global_history and global_history[i].globally_ordered_update != None:       # C4. if Global History[i].Ordered is not empty
+                Local_Aru += 1                                                  # C5. Local Aru++
+                i += 1                                                          # C6. i++
+            else:                                                               # C7. else
+                return                                                          # C8. return
+
+    # Figure 12: Procedure invoked to handle client update
+    def Client_Update_Handler(U):
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        #output("In Client Update handler for server: ",My_server_id, " with update number ", U.timestamp, " with client id: ", U.client_id)
+        if state == State.LEADER_ELECTION:                                      # A1. if(State = leader election)
+            #output("I AM IN LEADER ELECTION STATE: ", My_server_id)
+            if U.server_id != My_server_id:                                     # A2. if(U.server id != My server id)
+                return                                                          # A3. return
+            if Enqueue_Update(U):                                               # A4. if(Enqueue Update(U))
+                Add_to_Pending_Updates(U)                                       # A5. Add to Pending Updates(U)
+            #send(('Leader_Election_Log', My_server_id, Pending_Updates, time.time()), to=monitor)
+        elif state == State.REG_NONLEADER:                                      # A6. if(State = reg nonleader)
+            #output("I AM A NON LEADER: ", My_server_id)
+            if U.server_id == My_server_id:                                     # A7. if(U.server id = My server id)
+                Add_to_Pending_Updates(U)                                       # A8. Add to Pending Updates(U)
+                #output("Sending a client request from server: ", My_server_id, " to Leader: ", leader_id())
+                sendMessage(('Client_Update',U), to=servers[leader_id()])       # A9. SEND to leader: U  #TODO
+                #send(('Non_Leader_Log', My_server_id, Last_Installed, Pending_Updates, time.time()), to=monitor)
+        elif state == State.REG_LEADER:                                         # A10. if(State = reg leader)
+            #output("I AM THE LEADER in Client update handler: ", My_server_id)
+            if Enqueue_Update(U):                                               # A11. if(Enqueue Update(U))
+                if U.server_id == My_server_id:                                 # A12. if U.server id = My server id
+                    Add_to_Pending_Updates(U)                                   # A13. Add to Pending Updates(U)
+                #send(('Leader_Log', My_server_id, Last_Installed, Update_Queue, time.time()), to=monitor)   # sending to Monitor for logging it to ensure 5.7 section of the paper
+                Send_Proposal()                                                 # A14. Send Proposal()
+
+    #Figure-12 Part B: Procedure invoked when update timer for a particular client expires
+    def Expiration_Update_Timer(U):                                             # B1. Upon expiration of Update Timer(client id)
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+
+        #output("Update Timer expired for client: ", client_ID, " in the server: ", My_server_id, "with value: ", self.Update_Timer)
+
+        Update_Timer_[U.client_id].cancel()                                     # B2. Restart Update Timer(client id)
+        Update_Timer_[U.client_id] = Timer(self.Update_Timer, Expiration_Update_Timer, [U])   # B2. Restart Update Timer(client id)
+        Update_Timer_[U.client_id].start()                                      # B2. Restart Update Timer(client id)
+
+        #output("Starting Update Timer for client: ", client_ID, " in the server: ", My_server_id, " with value: ", self.Update_Timer)
+
+        if state == State.REG_NONLEADER:                                        # B3. if(State = reg nonleader)
+
+            leader = leader_id()                                                # Getting Leader id to which client update will be send
+            #send(('Expire_Update_Timer', My_server_id, Last_Installed, leader, U.client_id, time.time()), to=monitor)   # sending to Monitor for logging it to ensure 5.7 section of the paper
+            sendMessage(('Client_Update', U), to=servers[leader])               # B4. SEND to leader: Pending Updates[client id]
+
+            #output("I AM A NON LEADER: ", My_server_id, " in expiration of Update Timer")
+
+            #if client_ID in Pending_Updates:                                    # checking clientID in the pending updates for that server before sending the update to the leader
+
+                #output("Sending a client request:", client_ID," from server: ", My_server_id, " to Leader: ", leader_id(), " when update timer expired")
+                #output("Pending Updates list in Expire Update Timer: ", Pending_Updates.keys(), "client ID: ", client_ID)
+
+            #    U = Pending_Updates[client_ID]                                  # B4. SEND to leader: Pending Updates[client id]
+
+                #output("Got the update message for sending to leader: ", leader_id(), " from server: ", My_server_id)
+
+            #    leader = leader_id()                                            # Getting Leader id to which client update will be send
+            #    send(('Expire_Update_Timer', My_server_id, Last_Installed, leader, client_ID, time.time()), to=monitor)   # sending to Monitor for logging it to ensure 5.7 section of the paper
+            #    sendMessage(('Client_Update', U), to=servers[leader])           # B4. SEND to leader: Pending Updates[client id]
+            #else:
+            #    output("Client ID: ", client_ID, " is not in Pending Updates when expiration of update timer occurs")   # Error handling when update timer for a particular client expires and there is no pending updates for that corresponding client
+
+
+    # Figure 13: Procedure invoked to append client update to Update Queue for the leader
+    def Enqueue_Update(U):                                                      # A1. bool Enqueue Update(Client Update U)
+        if isZombie:
+            return False                                                        # To replicate the behaviour that server is dead
+        #output("In Enqueue Update for server: ", My_server_id, " and leader is: ", leader_id(), " and U seq: ", U.timestamp)
+        if U.client_id in Last_Executed and U.timestamp < Last_Executed[U.client_id]:       # A2. if(U.timestamp < Last Executed[U.client id])
+            return False                                                        # A3. return false
+        #output(" Checking in Last Enqueued")
+        if U.client_id in Last_Enqueued and U.timestamp < Last_Enqueued[U.client_id]:       # A4. if(U.timestamp < Last Enqueued[U.client id])
+            return False                                                        # A5. return false
+        #output("Enqueuing U seq: ", U.timestamp)
+        Update_Queue.append(U)                                                  # A6. Add U to Update Queue
+        Last_Enqueued[U.client_id] = U.timestamp                                # A7. Last Enqueued[U.client id] ← U.timestamp
+        return True                                                             # A8. return true
+
+    # Figure 13: Procedure invoked when client update is being recceived by a server. Add the client update to server pending updates from it's local client
+    def Add_to_Pending_Updates(U):                                              # B1. Add to Pending Updates(Client Update U)
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        Pending_Updates[U.client_id] = U                                        # B2. Pending Updates[U.client id] ← U
+        Update_Timer_[U.client_id] = Timer(self.Update_Timer, Expiration_Update_Timer, [U])  # B3. Set Update Timer(U.client id)
+        Update_Timer_[U.client_id].start()                                      # B3. Set Update Timer(U.client id)
+
+        #output("Add to Pending Updates: Update Timer starting with value: ", self.Update_Timer)
+
+        # sync to disk                                                          # B4. **Sync to disk
+
+    # Figure 13: Procedure to enqueue any pending updates that are not bound and not already in the queue
+    def Enqueue_Unbound_Pending_Updates():                                      # C1. Enqueue Unbound Pending Updates()
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        for U in Pending_Updates:                                               # C2. For each Client Update U in Pending Updates[]
+            if not_bound(Pending_Updates[U]) and U not in Update_Queue:         # C3. if U is not bound and U is not in Update Queue
+                Enqueue_Update(Pending_Updates[U])                              # C4. Enqueue Update(U)
+
+    # Figure 13: Procedure to removes any bound updates from the Update Queue
+    def Remove_Bound_Updates_From_Queue():                                      # D1. Remove Bound Updates From Queue()
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        for U in Update_Queue:                                                  # D2. For each Client Update U in Update Queue
+        # D3. if U is bound or U.timestamp ≤ Last Executed[U.client id] or
+            # (U.timestamp ≤ Last Enqueued[U.client id] and U.server id 6= My server id)
+            if bound(U) or (U.client_id in Last_Executed and U.timestamp < Last_Executed[U.client_id]) or (U.client_id in Last_Enqueued and U.timestamp < Last_Enqueued[U.client_id] and U.server_id != My_server_id):
+                Update_Queue.pop(U)                                             # D4. Remove U from Update Queue
+                if Update_Queue[U].timestamp > Last_Enqueued[Update_Queue[U].client_id]:        # D5. if U.timestamp > Last Enqueued[U.client id]
+                    #output("Removing bound updates for client: ", U.client_id, " and update number: ", U.timestamp)
+                    Last_Enqueued[Update_Queue[U].client_id] = Update_Queue[U].timestamp        # D6. Last Enqueued[U.client id] ← U.timestamp
+
+    # Procedure used to find the current leader. The leader of view i is the server such that My server id ≡ i mod N, where N is the total number of servers in the system.
+    def leader_id():
+        return Last_Installed % replica_count                                   # to checck whether the current server is the leader or not
+
+    # Procedure use to find the leader of the last attempted view
+    def Leader_of_Last_Attempted(view):
+        #output("Leader_of_Last_Attempted with view: ", view, " max number of replica/servers: ", replica_count, " my server id: ", self.My_server_id)
+
+        return My_server_id == view % replica_count                             # My_server_id = view mode N, where N is the total number of servers
+
+    # Procedure invoked to check whether message is bounded or not
+    def not_bound(U):
+        if isZombie:
+            return False                                                        # To replicate the behaviour that server is dead
+        if U in self.bounded_updates:                                           # if the message is in bounded_updates, return false
+            return False                                                        # return False
+        else:
+            return True                                                         # return True
+
+    # Procedure invoked to check whether message is bounded or not
+    def bound(U):
+        if isZombie:
+            return False                                                        # To replicate the behaviour that server is dead
+        if U in self.bounded_updates:                                           # If the message is in bounded_updates, return true
+            return True                                                         # return True
+        else:
+            return False                                                        # return False
+
+    # Procedure invoked when a server receives a Prepare message from other server
+    def receive(msg=('Prepare', message), from_=p):
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        if Conflict(message) == False:                                          # check whether the message is a conflicting message or not
+            Receive_Prepare(message, p)                                         # if the message is not conflicting, process the message using Receive_Prepare API
+
+    # Procedure invoked when a server receives Prepare_ok message from other server
+    def receive(msg=('Prepare_ok', message), from_=p):
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        if Conflict(message) == False:                                          # check whether the message is a conflicting message or not
+            Receive_Prepare_OK(message)                                         # if the message is not conflicting, process the Prepare_ok message using Received_Prepare_OK API
+
+    # Procedure invoked when accept is received for the proposal of a message. This message will be received by all the live servers
+    def receive(msg=('Accept', message), from_=p):
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        if Conflict(message) == False:                                          # check whether the message is a conflicting message or not
+            Receive_Accept(message)                                             # if the message is not conflicting, process the accept message received for the proposal using Receive_Accept API
+
+    # Procedure invoked when a Porposal is received from the leader
+    def receive(msg=('Proposal', message), from_=p):
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+
+        #output("Received Proposal in Handler:",message.server_id, message.view, message.seq, message.update)
+
+        if Conflict(message) == False:                                          # check whether the message is a conflicting message or not
+            Receive_Proposal(message)                                           # If the message is not conflicting, process the proposal message using Receive_Proposal API
+
+    # Procedure invoked when a view change message is received
+    def receive(msg=('View_Change', message), from_=p):
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        #logging.critical("VC1 from" + str(p))
+        if Conflict(message) == False:                                          # check whether the message is a conflicting message or not
+            #logging.critical("VC2 from" + str(p))
+            Receive_View_Change(message)                                        # If the message is not conflicting, process the view change message using Receive_View_Change API
+
+    # Procedure invoked Upon receiving a vc proof message. When the message is for a later view, a server in the leader election state can immediately join the installed view
+    def receive(msg=('VC Proof',message), from_=p):
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        if Conflict(message) == False:                                          # check whether the message is a conflicting message or not
+            Receive_VC_Proof(message)                                           # If the message is not conflicting, process the vc proof message in which if the message is of later view, the current server can join the installed view
+
+    # Procedure invoked when client update is received with tag = Client_Update
+    def receive(msg=('Client_Update', message), from_=p):
+        if isZombie:
+            return                                                              # To replicate the behaviour that server is dead
+        if message.server_id != My_server_id and p in clients:                  # To handle error condition where client sends a message to a server id different from the server id containing in the message. Valid for Servers as Non-Leader can send the message to Leader.
+            logging.error("Invalid message from client to a wrong server as the message contains different server id")  # Logging the error
+            return
+        Client_Update_Handler(message)                                          # Invoke client update handler for the update message recevied from client
+
+    # Procedure to make server zombie (replicating failed state)
+    def receive(msg=('Make_Server_Zombie'), from_=p):
+        isZombie = True                                                         # Make the state of the server as zombie which is equivalent to server dead
+        logging.info("Making server Zombie: " + str(server_id))                 # Logging the message
+
+    #Procedure to make server up (again after failing)
+    def receive(msg=('Make_Server_Running'), from_=p):
+        isZombie = False                                                        # Make state of the server as non-zombie which is equivalent to server up
+        logging.info("Making server Running again: " + str(server_id))          # Logging the message
+
+class Client(process):
+    def setup(servers, client_id, numRequests, monitor, lossrate, delay):       # Setting up the Client
+        self.my_client_id = client_id                                           # Client id of the client
+        self.servers_list = list(servers)                                       # List of server processes so that it can send client update to required server process
+        self.requests_dict = dict()                                             # Request dictionary to find latency and throughput
+        self.numFullfilled = dict()                                             # To check whether all requests from client got a reply or not
+        self.isRequestServed = False                                            # Used to ensure each client has atmost one outstanding update request
+        self.isNotLive = False                                                  # To gracefully exit out the client when system is not live
+
+    def run():
+        #output("I am client ", my_client_id, str(servers_list))
+        #time.sleep(1)
+        i = 0
+        while i < numRequests:                                                  # Sending each client request such that a client has atmost one outstanding update request
+            isRequestServed = False                                             # use for making it false for each update request sent
+            req = "cmd" + str(i)                                                # client update message that is send
+            #Change the code for getting the server_id so that there is no conflict in server id while creating the client update and while sending it to the corresponding server.
+            #server_id = client_id%(len(servers))                               # To check if client sends a request to random server
+            #server_id = randint(0, len(servers)-1)                             # To check if client sends a request to random server
+            server_id = 0                                                       # Sending request to Server0
+            client_update = Client_Update(client_id,server_id,i,req)            # creation of client update message using clientID, serverID, request number and request message
+            requests_dict[i] = ['s','e','d'];                                   # Request dictionary containing start time, end time and difference between those time for each client request. Used for calculating latency and throughput
+            requests_dict[i][0] = time.time()                                   # Intializing the start time of the request with the current time
+            #output("Client: ", my_client_id, " sends an update: ", i)
+            send(('Client_Update',client_update), to=servers_list[server_id])   # sending client update request to the appropriate server process
+            #output("Request sending from client id: ", client_id, " to server: ", server_id)
+            #send(('Client_Log_Send', my_client_id, server_id, i, time.time()), to=monitor)  # sending to Monitor for logging it to ensure 5.7 section of the paper
+            send(('Update_Initiated'), to=monitor)                              # send a message to monitor so that monitor can start the timer for the starting of the client request
+            await(isRequestServed)                                              # Waiting for the reply for the client update request sent. Ensure there is atmost one outstanding request per client
+            if(isNotLive):                                                      # If the system is not live, gracefully exiting the client
+                break                                                           # breaking from the loop
+            i+=1                                                                # used for assigning new request number for the update request
+
+        if (isNotLive == False):
+            await(numRequests == len(numFullfilled))                            # Waiting for all client request to be served
+
+            # Calculating latency of all the client requests being served when all client updates are served
+            s = 0.0
+            for k in requests_dict:                                                 # iterating over all request dictionary
+                s += requests_dict[k][2]                                            # adding all the difference time for each request for calculating the latency
+                send(('latency', my_client_id, float(s/numRequests), ), to=monitor)     # sending the latency value to Monitor by each client
+                #output("Client: ", my_client_id ," exiting")                            # Graceful exit of client
+
+        #output("Sending done to Monitor by Client: ", client_id)
+        send(('done'), to=monitor)                                              # sending done message to Monitor
+        await(received('finish'))                                               # Waiting for finish message from Monitor
+        #output("Client Exiting")
+        exit(0)
+
+    # Procedure invoked when a reply is received from the server for an update requests
+    def receive(msg=('Reply', reply, id_, server_id), from_=p):
+        if id_ not in numFullfilled:
+            requests_dict[id_][1] = time.time()                                 # Finding the time at which request reply is received from the server
+            requests_dict[id_][2] = requests_dict[id_][1] - requests_dict[id_][0]   # Calculating difference between the start time of client update and end time at which reply from server was sent
+            send(('updateSuccess'), to=monitor)                                 # Send a message to Monitor so that timer in monitor can be reset to check whether a system is live or not
+            #send(('Client_Log_Reply', my_client_id, server_id, id_, time.time()), to=monitor) # sending to Monitor for logging it to ensure 5.7 section of the paper
+            #output("Client: ", my_client_id, " receives an update reply for: ", id_, " from server: ", server_id)
+            numFullfilled[id_] = 1                                              # Incrementing number of fulfilled requests
+            isRequestServed = True                                              # Reseting the variable to true so that next client update can be send
+
+    # Procedure invoked when Monitor sends the client that system is not live
+    def receive(msg=('NotLive'), from_=p):
+        isNotLive = True                                                        # For graceful exit of the client when system is not live
+        isRequestServed = True                                                  # As the client is awaiting on this variable
+
+    # Override the normal send API depending on the lossrate and delay
+    def sendMessage(message, to):
+        if lossCompute(lossrate):                                               #checks if the message should be sent depending on the lossrate
+            if delay != 0.0:                                                    #if delay is not 0, put a sleep
+                time.sleep(delay)
+            send(message, to=to)                                                #send the message instantly
+
+# Class used for Performance testing which holds the latency and throughput value by combining results for each run
+class result:
+    def __init__(self, numServers, numClients, numRequests):
+        self.numServers = numServers                                            # Initializing with the number of servers in the system
+        self.numClients = numClients                                            # Initializing with the number of clients in the system
+        self.numRequests = numRequests                                          # Initializing with the number of requests per client in the system
+        self.latencyList = []                                                   # Latency value list for each run
+        self.throughputList = []                                                # Throughput value list for each run
+        self.averageLatency = float()                                           # Average Latency value over all the runs
+        self.averageThroughput = float()                                        # Average Throughput value over all the runs
+
+    # Procedure used to calculate the average latency and avergae throughput over all the runs
+    def calculateAvg(self):
+        if len(self.latencyList) != 0:
+            self.averageLatency = numpy.mean(self.latencyList)                  # Doing the latency average over all the runs
+        if len(self.throughputList) != 0:
+            self.averageThroughput = numpy.mean(self.throughputList)            # Doing the Throughput average over all the runs
+
+class paxosSysBuilderMonitor(process):
+    def setup(isInput, nclients, nservers, nrequests, nruns, initProgressTimer, inUpdateTimer, lossRate, delayRate, timeout):
+        self.startTime = -1.0                                                   #Variable to calculate system throughput
+        self.endTime = -1.0                                                     #Variable to calculate system throughput
+        self.latencyDict = dict()                                               #Dict to store latencies of all clients
+        self.timer = 0.0                                                        #Variable to ensure system is live
+        self.threshold = timeout                                                #Threshold value to ensure system is live
+        self.viewLeader = dict()                                                #Dict that stores view and the leader elected in that view
+        self.leaderError = 0                                                    #Flag to check if single leader is elected within each view
+        self.makeLeaderZombie = False                                           #Flag to make leader Zombie
+        self.servers_list = list()                                              #List() of servers
+        self.isLive = True                                                      #Flag to check system is live
+        self.clientsDone = False                                                #Flag to know when all clients are done with their requests
+        self.logList = list()                                                   #List to maintain logs about client update handling
+        self.makeServerZombie = False                                           #Flag to make server zombie
+
+    def driver():
+        res = result(nservers, nclients, nrequests)                             #Create result class object to maintain result over multiple runs
+        f = open("results.txt", "a+")                                           #For every run adds results into a text file
+        #output("Number of CLients is ", numClients)
+        #output("Number of Servers is ", numServers)
+        for k in range(0, nruns):                                               #Do the following for n runs
+            output("STARTING THE RUN: ", k+1)
+            time.sleep(1)                                                       #Sleep before every run
+            servers = new(Server, num = nservers)                               #Creates server objects
+            clients = new(Client, num = nclients)                               #Creates client objects
+
+            i = 0
+            for server in servers:                                              #Set up all servers and log it to screen when setting up
+                output("Setting up the server: ", i)
+                setup(server, (list(servers), i, list(clients), self, lossRate, delayRate, initProgressTimer, inUpdateTimer))    #Sets up the servers
+                i += 1
+            servers_list = list(servers)                                        #Creates list of server objects
+
+            i = 0
+            for client in clients:                                              #Set up all clients and log it to screen when setting up
+                output("Setting up the Client: ", i)
+                setup(client, (list(servers), i, nrequests, self, lossRate, delayRate))        #Sets up client
+                i += 1
+
+            start(servers)                                                      #Starts servers
+            start(clients)                                                      #Starts clients
+
+            timer = time.time()                                                 #Timer to check if system is live
+
+            while isLive and not clientsDone:                                   #Sends timely pings to ensure liveness
+                send(('ping'), to=self)
+                --yeilds                                                        #Yeild point
+
+            #logData(k+1)                                                      #Call logData for logging different activities in a file which can be used to test the liveness of the system
+
+            if (not isLive):                                                    #If islive flag is false
+                send('NotLive', to=clients)                                     #Send system live message to clients which will let client stop
+                log = "ERROR: SYSTEM IS NOT LIVE"                               #Log error
+            else:
+                log = "SYSTEM IS LIVE"
+
+            logging.info(str(log))
+            heapq.heappush(logList,(time.time(), log))                          #Log the message in logList
+
+            await(each(c in clients, has=received(('done'), from_=c)))
+            #output("Sending Finish")
+            send(('finish'), to= (servers|clients))                          # Send done to servers to end their processes
+
+            #output("Sent Finish")
+            if (not isLive):
+                resetVariables()                                                #resetVariables to ensure smooth functioning of next runs
+                continue                                                        #continue for next run
+
+            latency = checkLatency()                                            #Call checkLatency to calculate this runs latency
+            throughput = checkThroughput()                                      #Call checkThroughput to calculate this runs throughput
+            res.latencyList.append(latency)                                     #Append latency to result list
+            res.throughputList.append(throughput)                               #Append throughput to result list
+            logging.info("Average latency: " + str(latency))                    #Log latency
+            logging.info("Average throughput: " + str(throughput))              #Log throughput
+            resetVariables()                                                    #Reset variables for next run
+            time.sleep(1)                                                       #Sleep before staring next run
+
+        res.calculateAvg()                                                      #At the end of all runs, calculate entire result average
+        f.write("Number of Servers: " + str(res.numServers) + "  Number of Clients: " + str(res.numClients) + " Number of Requests: " + str(res.numRequests) + " Update Timer: " + str(inUpdateTimer) + " Average Latency: " + str(res.averageLatency) + " Average Throughput: " + str(res.averageThroughput) + "\n")
+        return res                                                              #Return result to run()
+
+    def resetVariables():                                                       #Function to reset performance related variables between runs
+        latencyDict.clear()                                                     #Clear latency dict
+        viewLeader.clear()                                                      #Clear view:leader pair dict
+        leaderError = 0                                                         #Reinitialize leaderError
+        startTime = -1.0                                                        #Reinitialize startTime
+        endTime = -1.0                                                          #Reinitialize endTime
+        isLive = True                                                           #Reinitialize isLive
+        clientsDone = False                                                     #Reinitialize clientsDone
+
+    def checkThroughput():                                                      #Returns system throughput using startTime and endTime
+        return float ((nclients * nrequests) / (endTime - startTime))
+
+    def checkLatency():                                                         #Calculates system latency
+        s = 0                                                                   #sum until now
+        for x in latencyDict:                                                   #Goes through latencies of all clients
+            s = s + latencyDict[x]
+        return (s/nclients)                                                     #Returns average latency of system
+
+    def run():
+        results = []
+        # need to add default values for other parameters                       #Prints parameters for user's reference
+        if (isInput):
+            output("Number of Clients: ", nclients)
+            output("Number of Servers: ", nservers)
+            output("Number of Request per client ", nrequests)
+            output("Number of Runs: ", nruns)
+            output("Value of Progress Timer: ", initProgressTimer)
+            output("Value of Update Timer: ", inUpdateTimer)
+            output("Value of loss rate: ", lossRate)
+            output("Value of delay rate: ", delayRate)
+            output("Value of timeout: ", timeout)
+            #for nServers in range(4, 13, 4):
+            #    for nClients in range(5, 11, 5):
+            results.append(driver())                                  #Calls driver function to start the runs
+        else:
+            # pass
+            for nservers in range(4, 13, 4):
+                for nclients in range(5, 31, 5):
+                    results.append(driver())
+
+        # for r in results:
+
+        # Code to directly do the plot for the run
+        # for x in results:
+        #     print("Number of CLients is ", x.numClients)
+        #     print("Average Latency is ", x.averageLatency)
+
+        # plt.plot([x.numClients for x in results],[x.averageLatency for x in results])
+        # plt.xlabel('Number of Clients')
+        # plt.ylabel('Latency')
+        # plt.title('Varying Number of CLients')
+        # # print(results)
+        # plt.Figure()
+        # plt.show()
+        send('done', to= parent())                                              #To terminate process
+
+    def receive(msg=('ping')):                                                  #Receives ping from self to ensure system is live
+        if time.time() - timer > threshold:                                     #If currentTime-timeOfLastClientUpdateServed is greater than threshold - system is not live
+            isLive = False
+        if len(latencyDict) == nclients:                                        #Once latency for all clients is received, client processes can be stopped
+            clientsDone = True
+
+    def receive(msg=('latency', clientID, latency)):                            #After the client is done with all requests
+        latencyDict[clientID] = latency                                         #Stores latency of every client
+
+    def receive(msg=('Update_Initiated')):                                      #Message when client update has been initiated
+        if (startTime == -1):
+            startTime = time.time()                                             #Assings startTime for latency calculation
+
+    def receive(msg=('updateSuccess')):                                         #Message when client update is fulfilled
+        #output("Got Update Success Message from Client")
+        timer = time.time()                                                     #Variable used to make sure system is live
+        endTime = timer                                                         #Variable used to calculate system throughput
+
+    def isSingleLeader():                                                       #Makes sure each view has a single leader
+        if leaderError == 1:
+            output("ERROR: View already has a leader, cannot have multiple leaders in one view")
+
+    def receive(msg=('Leader_elected', server_id, view)):                       #Once leader is elected, sends leader id and view to call isSingleLeader if multiple leaders are elected for a view
+        #makeLeaderZombie = True                                                #Flag to make leader Zombie
+        #makeServerZombie = True                                                #Flag to make any server zombie
+        if makeServerZombie:
+            server_id = randint(0, len(servers_list)-1)                         #Make random server zombie
+            output("Random server is", server_id)
+        if makeLeaderZombie or makeServerZombie:                                #Test how the system behaves if leader/random server is made zombie
+            send('Make_Server_Zombie', to=servers_list[server_id])              #Make leader zombie
+            time.sleep(2)                                                       #Sleep before bringing server up again
+            send('Make_Server_Running', to=servers_list[server_id])             #Make leader running again
+        if view not in viewLeader.keys():
+            viewLeader[view] = server_id                                        #First instance of view assinging a leader
+        else:
+            leaderError = 1                                                     #View already has a leader
+            isSingleLeader()                                                    #Call isSingleLeader to log error message
+
+
+    #LOGGING MECHANISM for writing important send and receive message between client and servers within a run
+
+    #Logging procedure for Expire Update Timer
+    def receive(msg=('Expire_Update_Timer', server_id, view, leader, client_ID, logTime)):
+        log = "EXPIRE_UPDATE_TIMER: server " + str(server_id) +  " for view: " + str(view) + " sends a client update from client: " + str(client_ID) + " to leader: " + str(leader)
+        heapq.heappush(logList, (logTime, log))
+
+    #Logging procedure for Expire Progress Timer
+    def receive(msg=('Expire_Progress_Timer', server_id, lastAttempted, progressTimer, logTime)):
+        log = "EXPIRE_PROGRESS_TIMER: server " + str(server_id) +  " has got the progress timer expired with value: " + str(progressTimer) + " and have lastAttempted view as: " + str(lastAttempted)
+        heapq.heappush(logList, (logTime, log))
+
+    #Logging procedure when leader is elected
+    def receive(msg=('Leader_Elected_Log', server_id, lastInstalled, logTime)):
+        log = "LEADER_ELECTED: server " + str(server_id) +  " is the new leader with view: " + str(lastInstalled)
+        heapq.heappush(logList, (logTime, log))
+
+    #Logging procedure for listing out pending client updates when the server is participating in Leader Election
+    def receive(msg=('Leader_Election_Log', server_id, pendingUpdates, logTime)):
+        log = "LEADER ELECTION: server " + str(server_id) +  " has pending updates from clients: " + str(pendingUpdates.keys())
+        heapq.heappush(logList, (logTime, log))
+
+    #Logging procedure for listing out pending client updates in the Update Queue of the server
+    def receive(msg=('Leader_Log', server_id, view, pendingUpdates, logTime)):
+        s = ""
+        for i in range(len(pendingUpdates)):
+            s = s + str(pendingUpdates[i].client_id) + " "
+        log = "LEADER: server " + str(server_id) + " for view: " + str(view) + " has pending updates in UpdateQueue: " + str(s)
+        heapq.heappush(logList, (logTime, log))
+
+    #Logging procedure for listing out pending client updates in the Pending_Update list for Non-Leader servers
+    def receive(msg=('Non_Leader_Log', server_id, view, pendingUpdates, logTime)):
+        log = "NON LEADER: server " + str(server_id) + " for view: " + str(view) + " has pending updates from clients: " + str(pendingUpdates.keys())
+        heapq.heappush(logList, (logTime, log))
+
+    #Logging procedure for sending the client update to the corresponding server
+    def receive(msg=('Client_Log_Send', client_id, server_id, updateNumber, logTime)):
+        log = "CLIENT SEND: client " + str(client_id) + " has send an update to server: " + str(server_id) + " for updateNumber: " + str(updateNumber)
+        heapq.heappush(logList, (logTime, log))
+
+    #Logging procedure when client got a reply for an update from the corresponding server
+    def receive(msg=('Client_Log_Reply', client_id, server_id, updateNumber, logTime)):
+        log = "CLIENT REPLY: client " + str(client_id) + " has receives a reply for updateNumber: " + str(updateNumber) + " from server: " + str(server_id)
+        heapq.heappush(logList, (logTime, log))
+
+    #Logged the data in the run file. Based on the run number, file is numbered as run1.log, run2.log
+    def logData(runNumber):
+        #time.sleep(1)
+        fileName = "runLog" + str(runNumber) + ".log"
+        f = open(fileName, "w")
+        while(logList):
+            log = heapq.heappop(logList)
+            f.write(str(log[1]))
+            f.write("\n")
+        f.close()
+
+# Main driver procedure which can take input from command line and run the system using those parameters
+def main():
+    isInput = True if len(sys.argv) > 1 else False
+    nclients = int(sys.argv[1]) if len(sys.argv) > 1 else 31                    # First Argument: Number of Clients
+    nservers = int(sys.argv[2]) if len(sys.argv) > 2 else 4                     # Second Argument: Number of Servers
+    nrequests = int(sys.argv[3]) if len(sys.argv) > 3 else 50                   # Third Argument: Number of Requests per Client
+    nruns = int(sys.argv[4]) if len(sys.argv) > 4 else 3                        # Fourth Argument: Number of Runs
+    initProgressTimer = int(sys.argv[5]) if len(sys.argv) > 5 else 5            # Fifth Argument: Progress Timer value. After expiration, Leader Election will happen.
+    inUpdateTimer = int(sys.argv[6]) if len(sys.argv) > 6 else 3                # Sixth Argument: Update Timer value. After expiration for a client, client's request will be send to leader by non-leader server.
+    lossRate = int(sys.argv[7]) if len(sys.argv) > 7 else 0                     # Seventh Argument: Loss Rate value for message.
+    delayRate = int(sys.argv[8]) if len(sys.argv) > 8 else 0                    # Eight Argument: Delay rate for message
+    timeout = int(sys.argv[9]) if len(sys.argv) > 9 else 120                    # Max threshold value after which system will be declared as not live
+
+    monitor = new(paxosSysBuilderMonitor, num = 1)                              # Creation of Monitor Class Object
+    setup(monitor,(isInput, nclients, nservers, nrequests, nruns, initProgressTimer, inUpdateTimer, lossRate, delayRate, timeout))    # Setting up the monitor class object with number of server, number of clients, number of request per client, number of runs and progress timer value
+    start(monitor)                                                              # Calling run procedure of Monitor class
+    await(received('done'))                                                     # Waiting for done message from the Monitor class after all the required runs have completed
+    exit(0)                                                                     # Gracefully exiting the Main process
